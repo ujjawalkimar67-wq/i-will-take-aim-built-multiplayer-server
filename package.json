@@ -1,0 +1,12 @@
+{
+  "name": "cube-village-stand-off-lan",
+  "private": true,
+  "version": "1.0.0",
+  "description": "LAN relay server for Cube Village Stand-Off",
+  "scripts": {
+    "start:lan": "node server.js"
+  },
+  "dependencies": {
+    "ws": "^8.18.3"
+  }
+}
