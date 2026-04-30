@@ -3,6 +3,28 @@ const { WebSocketServer } = require("ws");
 
 const DEFAULT_HOST = "0.0.0.0";
 const DEFAULT_PORT = 8765;
+const HEARTBEAT_INTERVAL_MS = Number(process.env.LAN_HEARTBEAT_INTERVAL_MS || 10000);
+const HEARTBEAT_TIMEOUT_MS = Number(process.env.LAN_HEARTBEAT_TIMEOUT_MS || 60000);
+const RESUME_GRACE_MS = Number(process.env.LAN_RESUME_GRACE_MS || 60000);
+const DEBUG_LOGS_ENABLED = process.env.LAN_DEBUG_LOGS === "1";
+const AIM_TRAINING_MESSAGE_TYPES = new Set([
+  "aim_training_state",
+  "aim_training_timer",
+  "aim_training_target_state",
+  "aim_training_target_respawn",
+  "aim_training_finished",
+  "aim_training_exit",
+  "aim_training_restart"
+]);
+
+function normalizeSessionMapId(mapId) {
+  const normalizedMapId = String(mapId || "").trim();
+  return normalizedMapId || "defaultVillage";
+}
+
+function normalizeResumeToken(token) {
+  return String(token || "").trim();
+}
 
 function makePlayerId(prefix) {
   return `${prefix}-${crypto.randomBytes(3).toString("hex")}`;
@@ -12,8 +34,20 @@ function nowMs() {
   return Date.now();
 }
 
+function logLanDebug(eventName, details = {}) {
+  if (!DEBUG_LOGS_ENABLED) {
+    return;
+  }
+
+  console.log("[LAN DEBUG]", {
+    at: new Date().toISOString(),
+    event: eventName,
+    ...details
+  });
+}
+
 function safeSendJson(connection, payload) {
-  if (!connection || connection.socket.readyState !== connection.socket.OPEN) {
+  if (!connection?.socket || connection.socket.readyState !== connection.socket.OPEN) {
     return false;
   }
 
@@ -27,156 +61,357 @@ class LanRelaySession {
     this.players = new Map();
   }
 
-  getPlayerSnapshot(connection) {
+  getHostRecord() {
+    return this.players.get(this.hostId) || null;
+  }
+
+  touchPlayer(record) {
+    if (!record) {
+      return;
+    }
+
+    record.lastPacketAt = nowMs();
+  }
+
+  resolveSessionMapId() {
+    const hostRecord = this.getHostRecord();
+    if (!hostRecord) {
+      return "defaultVillage";
+    }
+
+    return normalizeSessionMapId(
+      hostRecord.sessionMapId ||
+      hostRecord.state?.mapId
+    );
+  }
+
+  getPlayerSnapshot(record) {
     return {
-      playerId: connection.playerId,
-      role: connection.role,
-      name: connection.name,
-      state: connection.state,
-      lastPacketAt: connection.lastPacketAt
+      playerId: record.playerId,
+      role: record.role,
+      name: record.name,
+      state: record.state,
+      lastPacketAt: record.lastPacketAt,
+      connected: Boolean(record.isConnected)
     };
   }
 
   listOtherPlayers(excludePlayerId) {
     const otherPlayers = [];
-    for (const [playerId, connection] of this.players) {
+    for (const [playerId, record] of this.players) {
       if (playerId === excludePlayerId) {
         continue;
       }
 
-      otherPlayers.push(this.getPlayerSnapshot(connection));
+      otherPlayers.push(this.getPlayerSnapshot(record));
     }
 
     return otherPlayers;
   }
 
   broadcast(payload, { excludePlayerId = "" } = {}) {
-    for (const [playerId, connection] of this.players) {
-      if (playerId === excludePlayerId) {
+    for (const [playerId, record] of this.players) {
+      if (playerId === excludePlayerId || !record.isConnected) {
         continue;
       }
 
-      safeSendJson(connection, payload);
+      safeSendJson(record, payload);
     }
   }
 
   sendToHost(payload) {
-    const hostConnection = this.players.get(this.hostId);
-    if (!hostConnection) {
+    const hostRecord = this.getHostRecord();
+    if (!hostRecord?.isConnected) {
       return false;
     }
 
-    return safeSendJson(hostConnection, payload);
+    return safeSendJson(hostRecord, payload);
   }
 
-  sendError(connection, message) {
+  sendError(connection, message, code = "network_error") {
     safeSendJson(connection, {
       type: "error",
+      code,
       message
     });
   }
 
-  registerHost(connection, message) {
-    if (this.hostId && this.hostId !== connection.playerId) {
-      this.sendError(connection, "A LAN host is already active on this server.");
-      return;
+  rejectHandshake(connection, message, code = "network_error", closeReason = "Handshake rejected") {
+    this.sendError(connection, message, code);
+
+    try {
+      connection.socket.close(1008, closeReason);
+    } catch (error) {
+      // Ignore close errors during handshake rejection.
+    }
+  }
+
+  createPlayerRecord(role, message, address) {
+    return {
+      socket: null,
+      address,
+      playerId: "",
+      role,
+      name: String(message.name || "").trim(),
+      sessionMapId: normalizeSessionMapId(message.mapId),
+      state: null,
+      lastPacketAt: nowMs(),
+      resumeToken: normalizeResumeToken(message.resumeToken) || makePlayerId("resume"),
+      isConnected: false,
+      disconnectedAt: 0
+    };
+  }
+
+  resolveResumeRecord(role, message) {
+    const requestedPlayerId = String(message.playerId || "").trim();
+    const requestedResumeToken = normalizeResumeToken(message.resumeToken);
+    if (!requestedPlayerId || !requestedResumeToken) {
+      return null;
     }
 
-    if (!connection.playerId) {
-      connection.playerId = makePlayerId("host");
+    const record = this.players.get(requestedPlayerId);
+    if (!record || record.role !== role || record.resumeToken !== requestedResumeToken) {
+      return null;
     }
 
-    connection.role = "host";
-    connection.name = String(message.name || "").trim();
-    connection.lastPacketAt = nowMs();
+    return record;
+  }
 
-    this.hostId = connection.playerId;
-    this.players.set(connection.playerId, connection);
+  attachConnection(record, connection) {
+    if (
+      record.socket &&
+      record.socket !== connection.socket &&
+      record.socket.readyState === record.socket.OPEN
+    ) {
+      try {
+        record.socket.close(1012, "Connection replaced");
+      } catch (error) {
+        // Ignore cleanup errors during a resumed attach.
+      }
+    }
 
-    console.log(`[LAN] Host registered: ${connection.playerId} (${connection.address})`);
-    safeSendJson(connection, {
+    record.socket = connection.socket;
+    record.address = connection.address;
+    record.isConnected = true;
+    record.disconnectedAt = 0;
+    this.touchPlayer(record);
+
+    connection.playerRecord = record;
+  }
+
+  updateHandshakeDetails(record, message) {
+    record.name = String(message.name || "").trim();
+    record.sessionMapId = normalizeSessionMapId(message.mapId);
+    this.touchPlayer(record);
+  }
+
+  sendSessionReady(record, { isResume = false } = {}) {
+    safeSendJson(record, {
       type: "session_ready",
-      playerId: connection.playerId,
-      role: "host",
+      playerId: record.playerId,
+      role: record.role,
       hostId: this.hostId,
-      players: this.listOtherPlayers(connection.playerId)
+      sessionMapId: this.resolveSessionMapId(),
+      players: this.listOtherPlayers(record.playerId),
+      resumeToken: record.resumeToken,
+      isResume,
+      heartbeatIntervalMs: HEARTBEAT_INTERVAL_MS,
+      heartbeatTimeoutMs: HEARTBEAT_TIMEOUT_MS,
+      resumeGraceMs: RESUME_GRACE_MS
     });
   }
 
-  registerClient(connection, message) {
-    if (!this.hostId || !this.players.has(this.hostId)) {
-      this.sendError(connection, "No active LAN host is running on this server.");
+  registerHost(connection, message) {
+    const wantsResume = Boolean(message.resume);
+    const resumeRecord = this.resolveResumeRecord("host", message);
+
+    if (wantsResume && !resumeRecord) {
+      logLanDebug("reconnect_attempt_failed", {
+        role: "host",
+        address: connection.address,
+        playerId: String(message.playerId || "").trim(),
+        reason: "resume_not_available"
+      });
+      this.rejectHandshake(
+        connection,
+        "The hosted multiplayer session could not be restored.",
+        "resume_not_available",
+        "Resume unavailable"
+      );
       return;
     }
 
-    if (!connection.playerId) {
-      connection.playerId = makePlayerId("client");
+    if (resumeRecord) {
+      this.updateHandshakeDetails(resumeRecord, message);
+      this.attachConnection(resumeRecord, connection);
+      this.hostId = resumeRecord.playerId;
+
+      logLanDebug("reconnect_attempt_succeeded", {
+        role: "host",
+        playerId: resumeRecord.playerId,
+        address: resumeRecord.address
+      });
+      console.log(`[LAN] Host resumed: ${resumeRecord.playerId} (${resumeRecord.address})`);
+      this.sendSessionReady(resumeRecord, { isResume: true });
+      this.broadcast({
+        type: "host_reconnected",
+        playerId: resumeRecord.playerId,
+        name: resumeRecord.name
+      }, {
+        excludePlayerId: resumeRecord.playerId
+      });
+      return;
     }
 
-    connection.role = "client";
-    connection.name = String(message.name || "").trim();
-    connection.lastPacketAt = nowMs();
-    this.players.set(connection.playerId, connection);
+    const activeHost = this.getHostRecord();
+    if (activeHost) {
+      this.rejectHandshake(
+        connection,
+        "A LAN host is already active on this server.",
+        "host_exists",
+        "Host already active"
+      );
+      return;
+    }
 
-    console.log(`[LAN] Client joined: ${connection.playerId} (${connection.address})`);
-    safeSendJson(connection, {
-      type: "session_ready",
-      playerId: connection.playerId,
-      role: "client",
-      hostId: this.hostId,
-      players: this.listOtherPlayers(connection.playerId)
-    });
+    const record = this.createPlayerRecord("host", message, connection.address);
+    record.playerId = makePlayerId("host");
+    this.attachConnection(record, connection);
+
+    this.hostId = record.playerId;
+    this.players.set(record.playerId, record);
+
+    console.log(`[LAN] Host registered: ${record.playerId} (${record.address})`);
+    this.sendSessionReady(record, { isResume: false });
+  }
+
+  registerClient(connection, message) {
+    const wantsResume = Boolean(message.resume);
+    const resumeRecord = this.resolveResumeRecord("client", message);
+
+    if (wantsResume && !resumeRecord) {
+      logLanDebug("reconnect_attempt_failed", {
+        role: "client",
+        address: connection.address,
+        playerId: String(message.playerId || "").trim(),
+        reason: "resume_not_available"
+      });
+      this.rejectHandshake(
+        connection,
+        "This multiplayer session could not be restored.",
+        "resume_not_available",
+        "Resume unavailable"
+      );
+      return;
+    }
+
+    const hostRecord = this.getHostRecord();
+    if (!hostRecord) {
+      this.rejectHandshake(
+        connection,
+        "No active LAN host is running on this server.",
+        "no_host",
+        "No active host"
+      );
+      return;
+    }
+
+    if (resumeRecord) {
+      this.updateHandshakeDetails(resumeRecord, message);
+      this.attachConnection(resumeRecord, connection);
+
+      logLanDebug("reconnect_attempt_succeeded", {
+        role: "client",
+        playerId: resumeRecord.playerId,
+        address: resumeRecord.address
+      });
+      console.log(`[LAN] Client resumed: ${resumeRecord.playerId} (${resumeRecord.address})`);
+      this.sendSessionReady(resumeRecord, { isResume: true });
+      this.broadcast({
+        type: "peer_reconnected",
+        playerId: resumeRecord.playerId,
+        role: resumeRecord.role,
+        name: resumeRecord.name,
+        state: resumeRecord.state,
+        lastPacketAt: resumeRecord.lastPacketAt
+      }, {
+        excludePlayerId: resumeRecord.playerId
+      });
+      return;
+    }
+
+    if (!hostRecord.isConnected) {
+      this.rejectHandshake(
+        connection,
+        "The host is reconnecting. Please wait a moment and try again.",
+        "host_reconnecting",
+        "Host reconnecting"
+      );
+      return;
+    }
+
+    const record = this.createPlayerRecord("client", message, connection.address);
+    record.playerId = makePlayerId("client");
+    this.attachConnection(record, connection);
+    this.players.set(record.playerId, record);
+
+    console.log(`[LAN] Client joined: ${record.playerId} (${record.address})`);
+    this.sendSessionReady(record, { isResume: false });
     this.broadcast({
       type: "peer_joined",
-      playerId: connection.playerId,
-      role: connection.role,
-      name: connection.name,
-      state: connection.state,
-      lastPacketAt: connection.lastPacketAt
+      playerId: record.playerId,
+      role: record.role,
+      name: record.name,
+      state: record.state,
+      lastPacketAt: record.lastPacketAt
     }, {
-      excludePlayerId: connection.playerId
+      excludePlayerId: record.playerId
     });
   }
 
   forwardPlayerState(connection, state) {
-    if (!connection.playerId || !state || typeof state !== "object" || Array.isArray(state)) {
-      this.sendError(connection, "player_state requires an active session and a state object.");
+    const record = connection.playerRecord;
+    if (!record?.playerId || !state || typeof state !== "object" || Array.isArray(state)) {
+      this.sendError(connection, "player_state requires an active session and a state object.", "invalid_state");
       return;
     }
 
-    connection.state = state;
-    connection.lastPacketAt = nowMs();
+    record.state = state;
+    record.sessionMapId = normalizeSessionMapId(state.mapId);
+    this.touchPlayer(record);
 
     this.broadcast({
       type: "player_state",
-      playerId: connection.playerId,
-      state: connection.state,
-      timestamp: connection.lastPacketAt
+      playerId: record.playerId,
+      state: record.state,
+      timestamp: record.lastPacketAt
     }, {
-      excludePlayerId: connection.playerId
+      excludePlayerId: record.playerId
     });
   }
 
   relayPlayerShot(connection, shot) {
-    if (!connection.playerId || !shot || typeof shot !== "object" || Array.isArray(shot)) {
-      this.sendError(connection, "player_shot requires an active session and a shot object.");
+    const record = connection.playerRecord;
+    if (!record?.playerId || !shot || typeof shot !== "object" || Array.isArray(shot)) {
+      this.sendError(connection, "player_shot requires an active session and a shot object.", "invalid_shot");
       return;
     }
 
-    connection.lastPacketAt = nowMs();
+    this.touchPlayer(record);
     this.broadcast({
       type: "player_shot",
-      playerId: connection.playerId,
+      playerId: record.playerId,
       shot,
-      timestamp: connection.lastPacketAt
+      timestamp: record.lastPacketAt
     }, {
-      excludePlayerId: connection.playerId
+      excludePlayerId: record.playerId
     });
   }
 
   requireHostAuthority(connection, messageType) {
-    if (connection.playerId !== this.hostId) {
-      this.sendError(connection, `${messageType} is host-authoritative and can only be sent by the host.`);
+    const record = connection.playerRecord;
+    if (!record || record.playerId !== this.hostId) {
+      this.sendError(connection, `${messageType} is host-authoritative and can only be sent by the host.`, "host_only");
       return false;
     }
 
@@ -184,40 +419,54 @@ class LanRelaySession {
   }
 
   forwardEnemySpawnRequest(connection, message) {
-    if (!connection.playerId) {
-      this.sendError(connection, "enemy_spawn_request requires an active session.");
+    const record = connection.playerRecord;
+    if (!record?.playerId) {
+      this.sendError(connection, "enemy_spawn_request requires an active session.", "invalid_session");
       return;
     }
 
-    if (!this.hostId || !this.players.has(this.hostId)) {
-      this.sendError(connection, "No active LAN host is available for enemy spawns.");
+    const hostRecord = this.getHostRecord();
+    if (!hostRecord) {
+      this.sendError(connection, "No active LAN host is available for enemy spawns.", "no_host");
       return;
     }
 
-    connection.lastPacketAt = nowMs();
+    if (!hostRecord.isConnected) {
+      this.sendError(connection, "The host is reconnecting. Please wait a moment.", "host_reconnecting");
+      return;
+    }
+
+    this.touchPlayer(record);
     this.sendToHost({
       type: "enemy_spawn_request",
-      playerId: connection.playerId,
+      playerId: record.playerId,
       count: Math.max(1, Number(message.count) || 1),
       difficultyKey: String(message.difficultyKey || "")
     });
   }
 
   forwardEnemyWaveRequest(connection, message) {
-    if (!connection.playerId) {
-      this.sendError(connection, "enemy_wave_request requires an active session.");
+    const record = connection.playerRecord;
+    if (!record?.playerId) {
+      this.sendError(connection, "enemy_wave_request requires an active session.", "invalid_session");
       return;
     }
 
-    if (!this.hostId || !this.players.has(this.hostId)) {
-      this.sendError(connection, "No active LAN host is available for wave requests.");
+    const hostRecord = this.getHostRecord();
+    if (!hostRecord) {
+      this.sendError(connection, "No active LAN host is available for wave requests.", "no_host");
       return;
     }
 
-    connection.lastPacketAt = nowMs();
+    if (!hostRecord.isConnected) {
+      this.sendError(connection, "The host is reconnecting. Please wait a moment.", "host_reconnecting");
+      return;
+    }
+
+    this.touchPlayer(record);
     this.sendToHost({
       type: "enemy_wave_request",
-      playerId: connection.playerId,
+      playerId: record.playerId,
       enemyCount: Math.max(1, Number(message.enemyCount) || 1),
       waveCount: Math.max(1, Number(message.waveCount) || 1),
       difficultyKey: String(message.difficultyKey || "")
@@ -225,26 +474,28 @@ class LanRelaySession {
   }
 
   broadcastCombatState(connection, players) {
+    const record = connection.playerRecord;
     if (!this.requireHostAuthority(connection, "player_combat_state")) {
       return;
     }
 
     const payloadPlayers = Array.isArray(players) ? players : [];
-    connection.lastPacketAt = nowMs();
+    this.touchPlayer(record);
     this.broadcast({
       type: "player_combat_state",
       players: payloadPlayers
     }, {
-      excludePlayerId: connection.playerId
+      excludePlayerId: record.playerId
     });
   }
 
   broadcastPlayerDamage(connection, message) {
+    const record = connection.playerRecord;
     if (!this.requireHostAuthority(connection, "player_damage")) {
       return;
     }
 
-    connection.lastPacketAt = nowMs();
+    this.touchPlayer(record);
     this.broadcast({
       type: "player_damage",
       playerId: String(message.playerId || ""),
@@ -255,21 +506,22 @@ class LanRelaySession {
       maxHp: Number(message.maxHp) || 100,
       isDead: Boolean(message.isDead)
     }, {
-      excludePlayerId: connection.playerId
+      excludePlayerId: record.playerId
     });
   }
 
   broadcastPlayerRespawn(connection, message) {
+    const record = connection.playerRecord;
     if (!this.requireHostAuthority(connection, "player_respawn")) {
       return;
     }
 
     if (!message?.state || typeof message.state !== "object" || Array.isArray(message.state)) {
-      this.sendError(connection, "player_respawn requires a state object.");
+      this.sendError(connection, "player_respawn requires a state object.", "invalid_respawn_state");
       return;
     }
 
-    connection.lastPacketAt = nowMs();
+    this.touchPlayer(record);
     this.broadcast({
       type: "player_respawn",
       playerId: String(message.playerId || ""),
@@ -277,44 +529,47 @@ class LanRelaySession {
       maxHp: Number(message.maxHp) || 100,
       state: message.state
     }, {
-      excludePlayerId: connection.playerId
+      excludePlayerId: record.playerId
     });
   }
 
   broadcastEnemySpawn(connection, enemies) {
+    const record = connection.playerRecord;
     if (!this.requireHostAuthority(connection, "enemy_spawned")) {
       return;
     }
 
-    connection.lastPacketAt = nowMs();
+    this.touchPlayer(record);
     this.broadcast({
       type: "enemy_spawned",
       enemies: Array.isArray(enemies) ? enemies : []
     }, {
-      excludePlayerId: connection.playerId
+      excludePlayerId: record.playerId
     });
   }
 
   broadcastEnemyState(connection, enemies) {
+    const record = connection.playerRecord;
     if (!this.requireHostAuthority(connection, "enemy_state")) {
       return;
     }
 
-    connection.lastPacketAt = nowMs();
+    this.touchPlayer(record);
     this.broadcast({
       type: "enemy_state",
       enemies: Array.isArray(enemies) ? enemies : []
     }, {
-      excludePlayerId: connection.playerId
+      excludePlayerId: record.playerId
     });
   }
 
   broadcastEnemyDamage(connection, message) {
+    const record = connection.playerRecord;
     if (!this.requireHostAuthority(connection, "enemy_damage")) {
       return;
     }
 
-    connection.lastPacketAt = nowMs();
+    this.touchPlayer(record);
     this.broadcast({
       type: "enemy_damage",
       enemyId: String(message.enemyId || ""),
@@ -325,38 +580,125 @@ class LanRelaySession {
       maxHp: Number(message.maxHp) || 100,
       isDead: Boolean(message.isDead)
     }, {
-      excludePlayerId: connection.playerId
+      excludePlayerId: record.playerId
     });
   }
 
   broadcastEnemyRemoved(connection, message) {
+    const record = connection.playerRecord;
     if (!this.requireHostAuthority(connection, "enemy_removed")) {
       return;
     }
 
-    connection.lastPacketAt = nowMs();
+    this.touchPlayer(record);
     this.broadcast({
       type: "enemy_removed",
       enemyId: String(message.enemyId || ""),
       reason: String(message.reason || "removed")
     }, {
-      excludePlayerId: connection.playerId
+      excludePlayerId: record.playerId
     });
   }
 
   broadcastEnemyAttack(connection, message) {
+    const record = connection.playerRecord;
     if (!this.requireHostAuthority(connection, "enemy_attack")) {
       return;
     }
 
-    connection.lastPacketAt = nowMs();
+    this.touchPlayer(record);
     this.broadcast({
       type: "enemy_attack",
       enemyId: String(message.enemyId || ""),
       targetPlayerId: String(message.targetPlayerId || "")
     }, {
-      excludePlayerId: connection.playerId
+      excludePlayerId: record.playerId
     });
+  }
+
+  broadcastHealthPickupSpawn(connection, message) {
+    const record = connection.playerRecord;
+    if (!this.requireHostAuthority(connection, "health_pickup_spawned")) {
+      return;
+    }
+
+    this.touchPlayer(record);
+    this.broadcast({
+      type: "health_pickup_spawned",
+      pickups: Array.isArray(message.pickups) ? message.pickups : []
+    }, {
+      excludePlayerId: record.playerId
+    });
+  }
+
+  broadcastHealthPickupRemoved(connection, message) {
+    const record = connection.playerRecord;
+    if (!this.requireHostAuthority(connection, "health_pickup_removed")) {
+      return;
+    }
+
+    this.touchPlayer(record);
+    this.broadcast({
+      type: "health_pickup_removed",
+      pickupId: String(message.pickupId || ""),
+      reason: String(message.reason || "removed"),
+      removedBy: String(message.removedBy || "")
+    }, {
+      excludePlayerId: record.playerId
+    });
+  }
+
+  broadcastAimTrainingMessage(connection, message) {
+    const record = connection.playerRecord;
+    if (!this.requireHostAuthority(connection, message.type || "aim_training_sync")) {
+      return;
+    }
+
+    this.touchPlayer(record);
+
+    const payload = {
+      type: String(message.type || ""),
+      playerId: record.playerId
+    };
+
+    if (message.state && typeof message.state === "object" && !Array.isArray(message.state)) {
+      payload.state = message.state;
+    }
+    if (typeof message.mode === "string") {
+      payload.mode = message.mode;
+    }
+    if (Number.isFinite(Number(message.remainingSeconds))) {
+      payload.remainingSeconds = Math.max(0, Math.ceil(Number(message.remainingSeconds)));
+    }
+    if (message.targetState && typeof message.targetState === "object" && !Array.isArray(message.targetState)) {
+      payload.targetState = message.targetState;
+    }
+
+    this.broadcast(payload, {
+      excludePlayerId: record.playerId
+    });
+  }
+
+  handleExplicitLeave(connection) {
+    const record = connection.playerRecord;
+    if (!record || !this.players.has(record.playerId)) {
+      return;
+    }
+
+    connection.handledDisconnect = true;
+    if (record.socket === connection.socket) {
+      record.socket = null;
+      record.isConnected = false;
+      record.disconnectedAt = nowMs();
+    }
+
+    this.finalizeDisconnect(record, { reason: "left" });
+
+    try {
+      connection.socket.close(1000, "Leaving session");
+    } catch (error) {
+      // Ignore close errors during leave cleanup.
+    }
   }
 
   handleMessage(connection, message) {
@@ -369,6 +711,16 @@ class LanRelaySession {
 
     if (messageType === "join_session") {
       this.registerClient(connection, message);
+      return;
+    }
+
+    if (messageType === "leave_session") {
+      this.handleExplicitLeave(connection);
+      return;
+    }
+
+    if (messageType === "client_heartbeat") {
+      this.touchPlayer(connection.playerRecord);
       return;
     }
 
@@ -432,30 +784,87 @@ class LanRelaySession {
       return;
     }
 
-    this.sendError(connection, `Unsupported message type: ${JSON.stringify(messageType)}`);
-  }
-
-  disconnect(connection) {
-    if (!connection.playerId || !this.players.has(connection.playerId)) {
+    if (messageType === "health_pickup_spawned") {
+      this.broadcastHealthPickupSpawn(connection, message);
       return;
     }
 
-    this.players.delete(connection.playerId);
-    const wasHost = connection.playerId === this.hostId;
+    if (messageType === "health_pickup_removed") {
+      this.broadcastHealthPickupRemoved(connection, message);
+      return;
+    }
 
-    if (wasHost) {
+    if (AIM_TRAINING_MESSAGE_TYPES.has(messageType)) {
+      this.broadcastAimTrainingMessage(connection, message);
+      return;
+    }
+
+    this.sendError(connection, `Unsupported message type: ${JSON.stringify(messageType)}`, "unsupported_message");
+  }
+
+  handleSocketClose(connection) {
+    if (connection.handledDisconnect) {
+      return;
+    }
+
+    const record = connection.playerRecord;
+    if (!record || !this.players.has(record.playerId) || record.socket !== connection.socket) {
+      return;
+    }
+
+    record.socket = null;
+    record.isConnected = false;
+    record.disconnectedAt = nowMs();
+    record.lastPacketAt = nowMs();
+
+    if (record.playerId === this.hostId) {
+      console.log(`[LAN] Host connection lost: ${record.playerId}`);
+      this.broadcast({
+        type: "host_connection_lost",
+        playerId: record.playerId,
+        graceMs: RESUME_GRACE_MS
+      }, {
+        excludePlayerId: record.playerId
+      });
+      return;
+    }
+
+    console.log(`[LAN] Client connection lost: ${record.playerId}`);
+    this.broadcast({
+      type: "peer_connection_lost",
+      playerId: record.playerId,
+      graceMs: RESUME_GRACE_MS
+    }, {
+      excludePlayerId: record.playerId
+    });
+  }
+
+  finalizeDisconnect(record, { reason = "left" } = {}) {
+    if (!record?.playerId || !this.players.has(record.playerId)) {
+      return;
+    }
+
+    this.players.delete(record.playerId);
+
+    if (record.playerId === this.hostId) {
       const remainingPlayers = [...this.players.values()];
       this.players.clear();
       this.hostId = "";
-      console.log(`[LAN] Host disconnected: ${connection.playerId}`);
+
+      const sessionReason = reason === "left" ? "host_left" : "host_disconnected";
+      console.log(`[LAN] Host session ended: ${record.playerId} (${sessionReason})`);
 
       for (const remainingPlayer of remainingPlayers) {
         safeSendJson(remainingPlayer, {
           type: "session_closed",
-          reason: "host_disconnected"
+          reason: sessionReason
         });
+
         try {
-          remainingPlayer.socket.close(1001, "Host disconnected");
+          remainingPlayer.socket?.close(
+            1001,
+            sessionReason === "host_left" ? "Host left" : "Host disconnected"
+          );
         } catch (error) {
           // Ignore close errors during cleanup.
         }
@@ -463,13 +872,67 @@ class LanRelaySession {
       return;
     }
 
-    console.log(`[LAN] Client disconnected: ${connection.playerId}`);
+    const leaveReason = reason === "left" ? "left" : "reconnect_failed";
+    console.log(`[LAN] Client removed: ${record.playerId} (${leaveReason})`);
     this.broadcast({
       type: "peer_left",
-      playerId: connection.playerId
+      playerId: record.playerId,
+      reason: leaveReason
     }, {
-      excludePlayerId: connection.playerId
+      excludePlayerId: record.playerId
     });
+  }
+
+  performMaintenance() {
+    const currentTime = nowMs();
+
+    for (const record of [...this.players.values()]) {
+      if (record.isConnected) {
+        const elapsedSincePacketMs = currentTime - record.lastPacketAt;
+        if (elapsedSincePacketMs > HEARTBEAT_TIMEOUT_MS) {
+          logLanDebug("heartbeat_missed", {
+            playerId: record.playerId,
+            role: record.role,
+            address: record.address,
+            elapsedMs: elapsedSincePacketMs,
+            timeoutMs: HEARTBEAT_TIMEOUT_MS
+          });
+          console.warn(`[LAN] Heartbeat timeout for ${record.playerId}`);
+          const activeSocket = record.socket;
+          if (activeSocket && activeSocket.readyState !== activeSocket.CLOSED) {
+            activeSocket.__heartbeatTimeout = true;
+            try {
+              activeSocket.terminate?.();
+            } catch (error) {
+              try {
+                activeSocket.close(4000, "Heartbeat timeout");
+              } catch (closeError) {
+                // Ignore close errors during timeout cleanup.
+              }
+            }
+          }
+          continue;
+        }
+
+        safeSendJson(record, {
+          type: "server_heartbeat",
+          timestamp: currentTime
+        });
+        continue;
+      }
+
+      if (record.disconnectedAt && currentTime - record.disconnectedAt >= RESUME_GRACE_MS) {
+        logLanDebug("grace_window_expired", {
+          playerId: record.playerId,
+          role: record.role,
+          address: record.address,
+          disconnectedForMs: currentTime - record.disconnectedAt,
+          graceMs: RESUME_GRACE_MS,
+          reason: record.playerId === this.hostId ? "host_reconnect_expired" : "player_reconnect_expired"
+        });
+        this.finalizeDisconnect(record, { reason: "timeout" });
+      }
+    }
   }
 }
 
@@ -483,20 +946,22 @@ const wss = new WebSocketServer({
   port
 });
 
+const maintenanceIntervalId = setInterval(() => {
+  session.performMaintenance();
+}, HEARTBEAT_INTERVAL_MS);
+maintenanceIntervalId.unref?.();
+
 wss.on("connection", (socket, request) => {
   const connection = {
     socket,
     address: request.socket.remoteAddress || "unknown",
-    playerId: "",
-    role: "",
-    name: "",
-    state: null,
-    lastPacketAt: nowMs()
+    playerRecord: null,
+    handledDisconnect: false
   };
 
   socket.on("message", (rawMessage, isBinary) => {
     if (isBinary) {
-      session.sendError(connection, "Only UTF-8 text messages are supported.");
+      session.sendError(connection, "Only UTF-8 text messages are supported.", "binary_not_supported");
       return;
     }
 
@@ -504,12 +969,12 @@ wss.on("connection", (socket, request) => {
     try {
       message = JSON.parse(rawMessage.toString("utf-8"));
     } catch (error) {
-      session.sendError(connection, "Invalid JSON payload.");
+      session.sendError(connection, "Invalid JSON payload.", "invalid_json");
       return;
     }
 
     if (!message || typeof message !== "object" || Array.isArray(message)) {
-      session.sendError(connection, "Top-level JSON payload must be an object.");
+      session.sendError(connection, "Top-level JSON payload must be an object.", "invalid_payload");
       return;
     }
 
@@ -517,7 +982,7 @@ wss.on("connection", (socket, request) => {
   });
 
   socket.on("close", () => {
-    session.disconnect(connection);
+    session.handleSocketClose(connection);
   });
 
   socket.on("error", (error) => {
