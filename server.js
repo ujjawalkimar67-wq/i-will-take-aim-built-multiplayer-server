@@ -667,6 +667,9 @@ class LanRelaySession {
     if (typeof message.mode === "string") {
       payload.mode = message.mode;
     }
+    if (typeof message.sessionId === "string") {
+      payload.sessionId = message.sessionId;
+    }
     if (Number.isFinite(Number(message.remainingSeconds))) {
       payload.remainingSeconds = Math.max(0, Math.ceil(Number(message.remainingSeconds)));
     }
@@ -675,6 +678,21 @@ class LanRelaySession {
     }
 
     this.broadcast(payload, {
+      excludePlayerId: record.playerId
+    });
+  }
+
+  broadcastSessionWorldState(connection, message) {
+    const record = connection.playerRecord;
+    if (!this.requireHostAuthority(connection, "session_world_state")) {
+      return;
+    }
+
+    this.touchPlayer(record);
+    this.broadcast({
+      type: "session_world_state",
+      state: message.state || {}
+    }, {
       excludePlayerId: record.playerId
     });
   }
@@ -796,6 +814,11 @@ class LanRelaySession {
 
     if (AIM_TRAINING_MESSAGE_TYPES.has(messageType)) {
       this.broadcastAimTrainingMessage(connection, message);
+      return;
+    }
+
+    if (messageType === "session_world_state") {
+      this.broadcastSessionWorldState(connection, message);
       return;
     }
 
