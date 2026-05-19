@@ -22,6 +22,59 @@ function normalizeSessionMapId(mapId) {
   return normalizedMapId || "defaultVillage";
 }
 
+function normalizeSessionWorldMode(mode, isAimTraining) {
+  return mode === "aimTraining" || isAimTraining ? "aimTraining" : "normal";
+}
+
+function normalizeSessionWorldState(rawState = {}, session = null) {
+  const state = rawState && typeof rawState === "object" && !Array.isArray(rawState)
+    ? rawState
+    : {};
+  const hostRecord = session?.getHostRecord?.() || null;
+  const isAimTraining = Boolean(state.isAimTraining || state.mode === "aimTraining" || state.aimTrainingMode);
+  const mapId = normalizeSessionMapId(
+    state.mapId ||
+    hostRecord?.state?.mapId ||
+    hostRecord?.sessionMapId
+  );
+  const mode = normalizeSessionWorldMode(state.mode, isAimTraining);
+  const spawnPoint = state.spawnPoint && typeof state.spawnPoint === "object"
+    ? state.spawnPoint
+    : {};
+  const hasSessionActive = Object.prototype.hasOwnProperty.call(state, "sessionActive");
+  const sessionActive = hasSessionActive
+    ? state.sessionActive !== false
+    : Boolean(hostRecord);
+  const startedAt = Number.isFinite(Number(state.startedAt))
+    ? Number(state.startedAt)
+    : (sessionActive ? nowMs() : 0);
+
+  return {
+    mapId,
+    mapName: String(state.mapName || mapId).trim() || mapId,
+    mode,
+    isAimTraining: mode === "aimTraining",
+    aimTrainingMode: state.aimTrainingMode ? String(state.aimTrainingMode) : null,
+    spawnPoint: {
+      x: Number.isFinite(Number(spawnPoint.x)) ? Number(spawnPoint.x) : 0,
+      y: Number.isFinite(Number(spawnPoint.y)) ? Number(spawnPoint.y) : 0,
+      z: Number.isFinite(Number(spawnPoint.z)) ? Number(spawnPoint.z) : 0
+    },
+    hostPlayerId: String(state.hostPlayerId || session?.hostId || "").trim(),
+    startedAt,
+    sessionActive
+  };
+}
+
+function buildSessionWorldStateMessage(worldState) {
+  const state = normalizeSessionWorldState(worldState);
+  return {
+    type: "session_world_state",
+    ...state,
+    state
+  };
+}
+
 function normalizeResumeToken(token) {
   return String(token || "").trim();
 }
@@ -59,6 +112,7 @@ class LanRelaySession {
   constructor() {
     this.hostId = "";
     this.players = new Map();
+    this.worldState = null;
   }
 
   getHostRecord() {
@@ -74,6 +128,10 @@ class LanRelaySession {
   }
 
   resolveSessionMapId() {
+    if (this.worldState?.mapId) {
+      return normalizeSessionMapId(this.worldState.mapId);
+    }
+
     const hostRecord = this.getHostRecord();
     if (!hostRecord) {
       return "defaultVillage";
@@ -221,6 +279,22 @@ class LanRelaySession {
     });
   }
 
+  getSessionWorldState() {
+    if (this.worldState) {
+      return normalizeSessionWorldState(this.worldState, this);
+    }
+
+    return normalizeSessionWorldState({}, this);
+  }
+
+  sendSessionWorldState(record) {
+    if (!record?.isConnected) {
+      return false;
+    }
+
+    return safeSendJson(record, buildSessionWorldStateMessage(this.getSessionWorldState()));
+  }
+
   registerHost(connection, message) {
     const wantsResume = Boolean(message.resume);
     const resumeRecord = this.resolveResumeRecord("host", message);
@@ -327,6 +401,7 @@ class LanRelaySession {
       });
       console.log(`[LAN] Client resumed: ${resumeRecord.playerId} (${resumeRecord.address})`);
       this.sendSessionReady(resumeRecord, { isResume: true });
+      this.sendSessionWorldState(resumeRecord);
       this.broadcast({
         type: "peer_reconnected",
         playerId: resumeRecord.playerId,
@@ -357,6 +432,7 @@ class LanRelaySession {
 
     console.log(`[LAN] Client joined: ${record.playerId} (${record.address})`);
     this.sendSessionReady(record, { isResume: false });
+    this.sendSessionWorldState(record);
     this.broadcast({
       type: "peer_joined",
       playerId: record.playerId,
@@ -689,10 +765,9 @@ class LanRelaySession {
     }
 
     this.touchPlayer(record);
-    this.broadcast({
-      type: "session_world_state",
-      state: message.state || {}
-    }, {
+    this.worldState = normalizeSessionWorldState(message.state || message, this);
+    record.sessionMapId = normalizeSessionMapId(this.worldState.mapId);
+    this.broadcast(buildSessionWorldStateMessage(this.worldState), {
       excludePlayerId: record.playerId
     });
   }
