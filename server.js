@@ -383,8 +383,8 @@ class LanRelaySession {
     if (!hostRecord) {
       this.rejectHandshake(
         connection,
-        "No active LAN host is running on this server.",
-        "no_host",
+        "No host server found",
+        "NO_HOST_SESSION",
         "No active host"
       );
       return;
