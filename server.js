@@ -113,6 +113,12 @@ class LanRelaySession {
     this.hostId = "";
     this.players = new Map();
     this.worldState = null;
+    this.duelQueue = [];
+    this.duelRooms = new Map();
+    this.playerToDuelRoom = new Map();
+    this.playerToDuelWaiting = new Set();
+    this.playerSockets = new Map();
+    this.nextDuelConnectionId = 1;
   }
 
   getHostRecord() {
@@ -255,6 +261,7 @@ class LanRelaySession {
     this.touchPlayer(record);
 
     connection.playerRecord = record;
+    this.playerSockets.set(record.playerId, record);
   }
 
   updateHandshakeDetails(record, message) {
@@ -456,6 +463,10 @@ class LanRelaySession {
     record.sessionMapId = normalizeSessionMapId(state.mapId);
     this.touchPlayer(record);
 
+    if (this.routeDuelPlayerState(record)) {
+      return;
+    }
+
     this.broadcast({
       type: "player_state",
       playerId: record.playerId,
@@ -464,6 +475,249 @@ class LanRelaySession {
     }, {
       excludePlayerId: record.playerId
     });
+  }
+
+  isDuelTargetOpen(target) {
+    return Boolean(target?.socket && target.socket.readyState === target.socket.OPEN);
+  }
+
+  getSocketPlayerId(connection, message = {}) {
+    if (connection.playerRecord?.playerId) {
+      return connection.playerRecord.playerId;
+    }
+
+    if (connection.playerId) {
+      return connection.playerId;
+    }
+
+    const messagePlayerId = String(message.playerId || "").trim();
+    if (messagePlayerId) {
+      connection.playerId = messagePlayerId;
+      return connection.playerId;
+    }
+
+    connection.playerId = `conn_${this.nextDuelConnectionId++}`;
+    return connection.playerId;
+  }
+
+  getDuelConnectionTarget(connection) {
+    return connection.playerRecord || connection;
+  }
+
+  createDuelRoomId() {
+    return `duel_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+  }
+
+  removeFromDuelQueue(playerId) {
+    const normalizedPlayerId = String(playerId || "").trim();
+
+    for (let i = this.duelQueue.length - 1; i >= 0; i--) {
+      const item = this.duelQueue[i];
+      const shouldRemove =
+        !item ||
+        !this.isDuelTargetOpen(item.target) ||
+        (normalizedPlayerId && item.playerId === normalizedPlayerId);
+
+      if (!shouldRemove) {
+        continue;
+      }
+
+      if (item?.playerId) {
+        this.playerToDuelWaiting.delete(item.playerId);
+      }
+      this.duelQueue.splice(i, 1);
+    }
+
+    if (normalizedPlayerId) {
+      this.playerToDuelWaiting.delete(normalizedPlayerId);
+    }
+  }
+
+  getDuelOpponent(room, playerId) {
+    if (!room || !Array.isArray(room.players)) {
+      return null;
+    }
+
+    return room.players.find((id) => id !== playerId) || null;
+  }
+
+  cleanupDuelForPlayer(playerId, reason = "opponent_left") {
+    const normalizedPlayerId = String(playerId || "").trim();
+    if (!normalizedPlayerId) {
+      return;
+    }
+
+    this.removeFromDuelQueue(normalizedPlayerId);
+
+    const roomId = this.playerToDuelRoom.get(normalizedPlayerId);
+    if (!roomId) {
+      return;
+    }
+
+    const room = this.duelRooms.get(roomId);
+    if (room) {
+      const opponentId = this.getDuelOpponent(room, normalizedPlayerId);
+      const opponentTarget = opponentId ? this.playerSockets.get(opponentId) : null;
+
+      if (opponentTarget && this.isDuelTargetOpen(opponentTarget)) {
+        safeSendJson(opponentTarget, {
+          type: "duel_opponent_left",
+          roomId,
+          reason: reason || "opponent_left"
+        });
+      }
+
+      for (const pid of room.players) {
+        this.playerToDuelRoom.delete(pid);
+        this.playerToDuelWaiting.delete(pid);
+      }
+
+      this.duelRooms.delete(roomId);
+      console.log("[DUEL STEP2A] duel cleanup", {
+        roomId,
+        playerId: normalizedPlayerId,
+        reason
+      });
+      return;
+    }
+
+    this.playerToDuelRoom.delete(normalizedPlayerId);
+  }
+
+  handleDuelFind(connection, message) {
+    const playerId = this.getSocketPlayerId(connection, message);
+    const target = this.getDuelConnectionTarget(connection);
+    this.playerSockets.set(playerId, target);
+
+    console.log("[DUEL STEP2A] duel_find received", { playerId });
+
+    if (this.playerToDuelRoom.has(playerId)) {
+      safeSendJson(target, {
+        type: "duel_error",
+        reason: "already_in_duel",
+        roomId: this.playerToDuelRoom.get(playerId)
+      });
+      return;
+    }
+
+    if (this.playerToDuelWaiting.has(playerId)) {
+      safeSendJson(target, { type: "duel_waiting" });
+      return;
+    }
+
+    this.removeFromDuelQueue(playerId);
+
+    const opponent = this.duelQueue.shift();
+    if (!opponent || !this.isDuelTargetOpen(opponent.target)) {
+      this.duelQueue.push({
+        playerId,
+        target,
+        queuedAt: nowMs()
+      });
+      this.playerToDuelWaiting.add(playerId);
+
+      console.log("[DUEL STEP2A] player queued", {
+        playerId,
+        queueLength: this.duelQueue.length
+      });
+
+      safeSendJson(target, { type: "duel_waiting" });
+      return;
+    }
+
+    this.playerToDuelWaiting.delete(opponent.playerId);
+    this.playerToDuelWaiting.delete(playerId);
+
+    const roomId = this.createDuelRoomId();
+    const mapId = "duelArena";
+    const room = {
+      roomId,
+      mapId,
+      players: [opponent.playerId, playerId],
+      createdAt: nowMs(),
+      state: "active"
+    };
+
+    this.duelRooms.set(roomId, room);
+    this.playerToDuelRoom.set(opponent.playerId, roomId);
+    this.playerToDuelRoom.set(playerId, roomId);
+
+    console.log("[DUEL STEP2A] room created", {
+      roomId,
+      players: room.players,
+      mapId
+    });
+
+    safeSendJson(opponent.target, {
+      type: "duel_start",
+      roomId,
+      mapId,
+      opponentId: playerId,
+      spawnIndex: 0
+    });
+
+    safeSendJson(target, {
+      type: "duel_start",
+      roomId,
+      mapId,
+      opponentId: opponent.playerId,
+      spawnIndex: 1
+    });
+
+    console.log("[DUEL STEP2A] duel_start sent", { roomId });
+  }
+
+  handleDuelCancel(connection, message) {
+    const playerId = this.getSocketPlayerId(connection, message);
+    this.removeFromDuelQueue(playerId);
+
+    safeSendJson(this.getDuelConnectionTarget(connection), {
+      type: "duel_cancelled"
+    });
+
+    console.log("[DUEL STEP2A] duel cancelled", { playerId });
+  }
+
+  handleDuelDebugState(connection, message) {
+    const playerId = this.getSocketPlayerId(connection, message);
+
+    safeSendJson(this.getDuelConnectionTarget(connection), {
+      type: "duel_debug_state_result",
+      playerId,
+      queueLength: this.duelQueue.length,
+      roomCount: this.duelRooms.size,
+      isWaiting: this.playerToDuelWaiting.has(playerId),
+      roomId: this.playerToDuelRoom.get(playerId) || null
+    });
+  }
+
+  routeDuelPlayerState(record) {
+    const roomId = this.playerToDuelRoom.get(record.playerId);
+    if (!roomId) {
+      return false;
+    }
+
+    const room = this.duelRooms.get(roomId);
+    if (!room) {
+      this.playerToDuelRoom.delete(record.playerId);
+      return true;
+    }
+
+    const opponentId = this.getDuelOpponent(room, record.playerId);
+    const opponentTarget = opponentId ? this.playerSockets.get(opponentId) : null;
+
+    if (opponentTarget && this.isDuelTargetOpen(opponentTarget)) {
+      safeSendJson(opponentTarget, {
+        type: "player_state",
+        playerId: record.playerId,
+        state: record.state,
+        timestamp: record.lastPacketAt,
+        duelRoomId: roomId,
+        roomId
+      });
+    }
+
+    return true;
   }
 
   relayPlayerShot(connection, shot) {
@@ -817,6 +1071,21 @@ class LanRelaySession {
       return;
     }
 
+    if (messageType === "duel_find") {
+      this.handleDuelFind(connection, message);
+      return;
+    }
+
+    if (messageType === "duel_cancel") {
+      this.handleDuelCancel(connection, message);
+      return;
+    }
+
+    if (messageType === "duel_debug_state") {
+      this.handleDuelDebugState(connection, message);
+      return;
+    }
+
     if (messageType === "player_state") {
       this.forwardPlayerState(connection, message.state);
       return;
@@ -914,6 +1183,8 @@ class LanRelaySession {
     record.isConnected = false;
     record.disconnectedAt = nowMs();
     record.lastPacketAt = nowMs();
+    this.cleanupDuelForPlayer(record.playerId, "disconnect");
+    this.playerSockets.delete(record.playerId);
 
     if (record.playerId === this.hostId) {
       console.log(`[LAN] Host connection lost: ${record.playerId}`);
@@ -942,12 +1213,19 @@ class LanRelaySession {
       return;
     }
 
+    this.cleanupDuelForPlayer(record.playerId, reason);
+    this.playerSockets.delete(record.playerId);
     this.players.delete(record.playerId);
 
     if (record.playerId === this.hostId) {
       const remainingPlayers = [...this.players.values()];
       this.players.clear();
       this.hostId = "";
+      this.duelQueue.length = 0;
+      this.duelRooms.clear();
+      this.playerToDuelRoom.clear();
+      this.playerToDuelWaiting.clear();
+      this.playerSockets.clear();
 
       const sessionReason = reason === "left" ? "host_left" : "host_disconnected";
       console.log(`[LAN] Host session ended: ${record.playerId} (${sessionReason})`);
