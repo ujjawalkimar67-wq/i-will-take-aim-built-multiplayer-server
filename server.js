@@ -108,6 +108,71 @@ function safeSendJson(connection, payload) {
   return true;
 }
 
+async function fetchAuthorizedCosmeticsFromPlayerApi(sessionToken) {
+  if (!sessionToken || typeof sessionToken !== "string" || !sessionToken.trim()) {
+    return [];
+  }
+
+  try {
+    const response = await fetch("https://aim-built-player-api.ujjwalsoni262.workers.dev/player/profile", {
+      method: "GET",
+      headers: {
+        "Authorization": `Bearer ${sessionToken.trim()}`
+      }
+    });
+
+    if (!response.ok) {
+      return [];
+    }
+
+    const data = await response.json();
+    if (!data || !data.ok) {
+      return [];
+    }
+
+    let owned = null;
+    if (Array.isArray(data.ownedCosmetics)) owned = data.ownedCosmetics;
+    else if (Array.isArray(data.ownedCosmeticIds)) owned = data.ownedCosmeticIds;
+    else if (Array.isArray(data.cosmetics)) owned = data.cosmetics;
+    else if (Array.isArray(data.player?.ownedCosmetics)) owned = data.player.ownedCosmetics;
+    else if (Array.isArray(data.player?.ownedCosmeticIds)) owned = data.player.ownedCosmeticIds;
+    else if (Array.isArray(data.inventory?.cosmetics)) owned = data.inventory.cosmetics;
+
+    if (!owned) {
+      return [];
+    }
+
+    return owned.map(item => {
+      if (typeof item === "string") return item.trim();
+      if (item && typeof item === "object" && typeof item.id === "string") return item.id.trim();
+      if (item && typeof item === "object" && typeof item.cosmeticId === "string") return item.cosmeticId.trim();
+      return "";
+    }).filter(Boolean);
+  } catch (err) {
+    console.error("[COSMETIC VERIFICATION ERROR]", err);
+    return [];
+  }
+}
+
+function normalizeRequestedCosmeticState(input) {
+  return {
+    version: 1,
+    backCosmeticId: input?.backCosmeticId === "eagle_wings" ? "eagle_wings" : "",
+    trailCosmeticId: input?.trailCosmeticId === "glory_boots" ? "glory_boots" : ""
+  };
+}
+
+function sanitizeCosmeticStateForBroadcast(input, authorizedCosmetics) {
+  const norm = normalizeRequestedCosmeticState(input);
+  const auths = Array.isArray(authorizedCosmetics) ? authorizedCosmetics : [];
+  
+  return {
+    version: 1,
+    backCosmeticId: auths.includes("eagle_wings") ? norm.backCosmeticId : "",
+    trailCosmeticId: auths.includes("glory_boots") ? norm.trailCosmeticId : ""
+  };
+}
+
 class LanRelaySession {
   constructor() {
     this.hostId = "";
@@ -255,6 +320,7 @@ class LanRelaySession {
     this.touchPlayer(record);
 
     connection.playerRecord = record;
+    record.authorizedCosmetics = connection.authorizedCosmetics || [];
   }
 
   updateHandshakeDetails(record, message) {
@@ -450,6 +516,20 @@ class LanRelaySession {
     if (!record?.playerId || !state || typeof state !== "object" || Array.isArray(state)) {
       this.sendError(connection, "player_state requires an active session and a state object.", "invalid_state");
       return;
+    }
+
+    if (state.cosmetic) {
+      const originalBack = state.cosmetic.backCosmeticId;
+      const originalTrail = state.cosmetic.trailCosmeticId;
+
+      state.cosmetic = sanitizeCosmeticStateForBroadcast(state.cosmetic, record.authorizedCosmetics);
+
+      if (originalBack && originalBack !== state.cosmetic.backCosmeticId) {
+        console.warn(`[SECURITY WARN] Stripped unauthorized back cosmetic "${originalBack}" for playerId: ${record.playerId}`);
+      }
+      if (originalTrail && originalTrail !== state.cosmetic.trailCosmeticId) {
+        console.warn(`[SECURITY WARN] Stripped unauthorized trail cosmetic "${originalTrail}" for playerId: ${record.playerId}`);
+      }
     }
 
     record.state = state;
@@ -797,6 +877,20 @@ class LanRelaySession {
   handleMessage(connection, message) {
     const messageType = message?.type;
 
+    if (messageType === "client_auth") {
+      const token = message.sessionToken;
+      fetchAuthorizedCosmeticsFromPlayerApi(token).then(owned => {
+        connection.authorizedCosmetics = owned;
+        if (connection.playerRecord) {
+          connection.playerRecord.authorizedCosmetics = owned;
+        }
+        console.log(`[LAN AUTH] connection verified owned cosmetics for player ${connection.playerRecord?.playerId || 'pending'}:`, owned);
+      }).catch(err => {
+        console.error("[LAN AUTH ERROR]", err);
+      });
+      return;
+    }
+
     if (messageType === "host_session") {
       this.registerHost(connection, message);
       return;
@@ -1073,6 +1167,45 @@ wss.on("connection", (socket, request) => {
 
     if (!message || typeof message !== "object" || Array.isArray(message)) {
       session.sendError(connection, "Top-level JSON payload must be an object.", "invalid_payload");
+      return;
+    }
+
+    if (message && message.type === "client_auth") {
+      const sessionToken =
+        typeof message.sessionToken === "string"
+          ? message.sessionToken.trim()
+          : "";
+
+      // Never broadcast this message.
+      // Never log the full token.
+      connection.aimBuiltAuthReceived = Boolean(sessionToken);
+      connection.authorizedCosmetics = [];
+
+      if (sessionToken) {
+        fetchAuthorizedCosmeticsFromPlayerApi(sessionToken).then(owned => {
+          connection.authorizedCosmetics = owned;
+          if (connection.playerRecord) {
+            connection.playerRecord.authorizedCosmetics = owned;
+          }
+          console.log("[SERVER CLIENT AUTH] verified", {
+            socketId: connection.playerRecord?.playerId || "pending",
+            tokenPresent: true,
+            authorizedCosmeticCount: owned.length
+          });
+        }).catch(err => {
+          console.warn("[SERVER CLIENT AUTH] verify failed", {
+            socketId: connection.playerRecord?.playerId || "pending",
+            tokenPresent: true,
+            error: String(err?.message || err)
+          });
+          connection.authorizedCosmetics = [];
+        });
+      } else {
+        console.log("[SERVER CLIENT AUTH] missing token", {
+          socketId: connection.playerRecord?.playerId || "pending"
+        });
+      }
+
       return;
     }
 
